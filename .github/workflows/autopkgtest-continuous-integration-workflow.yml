@@ -1,0 +1,119 @@
+name: DEP-8 Continuous Integration
+
+on:
+  push:
+    branches:
+      - kip-github-workflow-autopkgtest
+  pull_request:
+    branches:
+      - kip-github-workflow-autopkgtest
+
+jobs:
+
+  extract-version:
+    name: Extracting version from debian/changelog...
+    runs-on: ubuntu-20.04
+    steps:
+
+      - name: Checking out HEAD...
+        uses: actions/checkout@v2
+
+      - name: Extract upstream and package versioning strings as artifacts...
+        run: |
+          sudo apt-get update
+          sudo apt-get -y install dpkg-dev
+          PISTACHE_UPSTREAM_VERSION=$(dpkg-parsechangelog | sed -rne 's/^Version: ([0-9.]+)[-+].*$$/\1/p')
+          PISTACHE_PACKAGE_VERSION=$(dpkg-parsechangelog --show-field Version)
+          echo $PISTACHE_UPSTREAM_VERSION > PISTACHE_UPSTREAM_VERSION
+          echo $PISTACHE_PACKAGE_VERSION > PISTACHE_PACKAGE_VERSION
+
+      - name: Preserve version string as artifact...
+        uses: actions/upload-artifact@v2
+        with:
+          name: version-artifacts
+          path: |
+            PISTACHE_UPSTREAM_VERSION
+            PISTACHE_PACKAGE_VERSION
+
+  build-source-package:
+    name: Building source package...
+    runs-on: ubuntu-20.04
+    needs: extract-version
+    steps:
+
+      - name: Checking out HEAD...
+        uses: actions/checkout@v2
+
+      - name: Recover version string artifact...
+        uses: actions/download-artifact@v1
+        with:
+          name: version-artifacts
+
+      - name: Installing build dependencies...
+        run: |
+          BUILD_DEPS=$(perl -ne 'next if /^#/; $p=(s/^Build-Depends:\s*/ / or (/^ / and $p)); s/,|\n|\([^)]+\)//mg; print if $p' < debian/control)
+          sudo apt-get install --no-install-recommends devscripts $BUILD_DEPS
+
+      - name: Building upstream tarball...
+        run: ./debian/rules get-orig-source
+
+      - name: Building source package metadata...
+        run: debuild -S -sa -us -uc
+
+      - name: Collect source artifacts...
+        run: |
+          PISTACHE_UPSTREAM_VERSION=$(<version-artifacts/PISTACHE_UPSTREAM_VERSION)
+          mkdir ../source
+          mv -v ../pistache_${PISTACHE_UPSTREAM_VERSION}* ../source
+
+      - name: Preserve source artifacts...
+        uses: actions/upload-artifact@v1
+        with:
+          name: source-package
+          path: ../source
+
+  autopkgtest:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-20.04]
+    needs:
+      - build-source-package
+    steps:
+
+      - name: Get version...
+        uses: actions/download-artifact@v1
+        with:
+          name: version-artifacts
+
+      - name: Recover artifacts...
+        uses: actions/download-artifact@v1
+        with:
+          name: source-package
+
+      - name: Install autopkgtest dependencies...
+        run: |
+          sudo apt-get update
+          sudo apt-get upgrade -y
+          sudo apt-get install autopkgtest qemu-system genisoimage
+
+      - name: Prepare container images...
+        run: |
+          autopkgtest-buildvm-ubuntu-cloud --verbose -r focal -a ppc64el
+          #autopkgtest-buildvm-ubuntu-cloud --verbose -r focal -a amd64
+
+      - name: Build and test package...
+        run: |
+          set +e
+          PISTACHE_UPSTREAM_VERSION=$(<version-artifacts/PISTACHE_UPSTREAM_VERSION)
+          PISTACHE_PACKAGE_VERSION=$(<version-artifacts/PISTACHE_PACKAGE_VERSION)
+
+          autopkgtest --shell-fail --apt-upgrade ./source-package/pistache_${PISTACHE_PACKAGE_VERSION}_source.changes -- qemu --qemu-command=qemu-system-ppc64le --ram-size=8192 --cpus=4 --show-boot ubuntu-focal-ppc64el.img --qemu-options='-enable-kvm -machine accel=tcg'
+
+          #sudo autopkgtest ./source-package/pistache_${PISTACHE_PACKAGE_VERSION}_source.changes -- null
+
+          # autopkgtest exit code 2 signifies skipped tests
+          if [ $? -gt 2 ]; then
+            exit 1
+          fi
+
